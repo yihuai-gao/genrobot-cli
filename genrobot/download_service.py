@@ -1,12 +1,15 @@
 import logging
+import multiprocessing
+import random
+import signal as _signal_mod
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from collections import deque
-from typing import Callable, List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple
 
 import requests
 import typer
@@ -14,7 +17,6 @@ from tqdm import tqdm
 
 from genrobot.exit_codes import EXIT_SUCCESS, EXIT_PARTIAL_FAILURE, EXIT_USER_CANCELLED
 from genrobot.i18n import t
-from genrobot.utils import retry_on_error
 
 logger = logging.getLogger('genrobot')
 
@@ -31,6 +33,119 @@ class _ShutdownRequested(Exception):
     """用户请求停止下载（Ctrl+C），用于协作式关闭流程"""
     pass
 
+
+# ======================================================================
+# Worker process: top-level functions + shared state via initializer
+# ======================================================================
+
+_wp_shared_bytes: Optional[multiprocessing.Value] = None
+_wp_shutdown: Optional[multiprocessing.Event] = None
+_wp_run_id: Optional[str] = None
+
+
+def _worker_init(shared_bytes, shutdown_event, run_id):
+    """Worker process initializer — sets shared state and ignores SIGINT."""
+    global _wp_shared_bytes, _wp_shutdown, _wp_run_id
+    _wp_shared_bytes = shared_bytes
+    _wp_shutdown = shutdown_event
+    _wp_run_id = run_id
+    # Let the main process handle Ctrl+C; workers just check the event
+    _signal_mod.signal(_signal_mod.SIGINT, _signal_mod.SIG_IGN)
+
+
+def _is_retryable_worker(exc: Exception) -> bool:
+    """Worker-safe retryable check (avoids cross-module circular imports)."""
+    if isinstance(exc, URLExpiredError):
+        return False
+    if isinstance(exc, requests.exceptions.HTTPError):
+        if exc.response is not None:
+            return exc.response.status_code not in {401, 403}
+        return True
+    return isinstance(exc, (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        ValueError,
+    ))
+
+
+def _download_file_once_wp(url: str, local_path: Path, expected_size: int) -> None:
+    """Download a single file (single attempt) inside a worker process."""
+    part_file = local_path.with_suffix(local_path.suffix + '.part')
+    if part_file.exists():
+        part_file.unlink()
+
+    try:
+        resp = requests.get(url, stream=True, timeout=120)
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (403, 404):
+            raise URLExpiredError(
+                f'URL expired or invalid: {e.response.status_code}'
+            )
+        raise
+
+    with open(part_file, 'wb') as f:
+        for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+            if _wp_shutdown.is_set():
+                raise _ShutdownRequested()
+            f.write(chunk)
+            with _wp_shared_bytes.get_lock():
+                _wp_shared_bytes.value += len(chunk)
+
+    actual_size = part_file.stat().st_size
+    if expected_size > 0 and actual_size != expected_size:
+        part_file.unlink()
+        raise ValueError(
+            f'Size mismatch: expected {expected_size}, got {actual_size}'
+        )
+
+    part_file.rename(local_path)
+
+
+def _download_file_wp(args: Tuple[str, str, int]) -> Tuple:
+    """Top-level worker entry point. Returns a result tuple.
+
+    Result forms:
+        ('success',     path_str, size)
+        ('cancelled',   path_str)
+        ('url_expired', path_str)
+        ('failed',      path_str, error_msg)
+    """
+    url, local_path_str, expected_size = args
+    local_path = Path(local_path_str)
+
+    max_retries = 3
+    initial_delay = 1.0
+    backoff_factor = 2.0
+    max_delay = 32.0
+    delay = initial_delay
+
+    for attempt in range(max_retries):
+        try:
+            _download_file_once_wp(url, local_path, expected_size)
+            return ('success', local_path_str, expected_size)
+        except _ShutdownRequested:
+            return ('cancelled', local_path_str)
+        except URLExpiredError:
+            return ('url_expired', local_path_str)
+        except Exception as e:
+            if attempt == max_retries - 1 or not _is_retryable_worker(e):
+                return ('failed', local_path_str, str(e))
+
+            jitter = delay * 0.25 * (random.random() * 2 - 1)
+            sleep_time = min(delay + jitter, max_delay)
+            delay = min(delay * backoff_factor, max_delay)
+
+            # Use Event.wait so a shutdown signal interrupts the sleep
+            if _wp_shutdown.wait(timeout=sleep_time):
+                return ('cancelled', local_path_str)
+
+    return ('failed', local_path_str, 'max retries exceeded')
+
+
+# ======================================================================
+# Formatting helpers
+# ======================================================================
 
 def _format_size(size_bytes: int, width: int = 0) -> str:
     if size_bytes >= 1024 ** 4:
@@ -59,23 +174,32 @@ def _format_elapsed(seconds: float, width: int = 0) -> str:
     return s.rjust(width) if width else s
 
 
-class _DownloadProgress:
-    """封装 tqdm 进度条，支持文件数和字节数双维度更新，实时速度统计"""
+# ======================================================================
+# Progress bar (main process only — polls shared_bytes from workers)
+# ======================================================================
 
-    # 滑动窗口大小（秒），用于计算实时速度
+class _DownloadProgress:
+    """封装 tqdm 进度条，支持文件数和字节数双维度更新，实时速度统计。
+
+    In multi-process mode a background thread polls the shared byte counter
+    written to by worker processes and updates the display.
+    """
+
     _SPEED_WINDOW = 2.0
-    # 采样间隔（秒），控制滑动窗口采样频率
     _SAMPLE_INTERVAL = 0.2
 
-    def __init__(self, total_files: int, total_size: int):
+    def __init__(self, total_files: int, total_size: int,
+                 shared_bytes: Optional[multiprocessing.Value] = None):
         self.total_files = total_files
         self.total_size = total_size
         self.downloaded_bytes = 0
+        self._shared_bytes = shared_bytes
         self._lock = threading.Lock()
         self._start_time = time.monotonic()
-        # 滑动窗口采样：(timestamp, cumulative_bytes)
         self._speed_samples: deque = deque()
         self._last_sample_time = 0.0
+        self._stop_polling = threading.Event()
+        self._poll_thread: Optional[threading.Thread] = None
         self._bar = tqdm(
             total=total_files,
             bar_format=(
@@ -88,37 +212,42 @@ class _DownloadProgress:
         self._refresh_desc()
         self._bar.refresh()
 
+        # Start a polling thread when using a shared byte counter
+        if shared_bytes is not None:
+            self._poll_thread = threading.Thread(
+                target=self._poll_loop, daemon=True, name='progress-poll',
+            )
+            self._poll_thread.start()
+
+    # ---- polling (multi-process mode) ----
+
+    def _poll_loop(self) -> None:
+        while not self._stop_polling.wait(timeout=self._SAMPLE_INTERVAL):
+            self._sync_shared_bytes()
+
+    def _sync_shared_bytes(self) -> None:
+        with self._shared_bytes.get_lock():
+            current = self._shared_bytes.value
+        with self._lock:
+            self.downloaded_bytes = current
+            now = time.monotonic()
+            self._speed_samples.append((now, current))
+            cutoff = now - self._SPEED_WINDOW
+            while self._speed_samples and self._speed_samples[0][0] < cutoff:
+                self._speed_samples.popleft()
+        self._refresh_desc()
+        self._bar.refresh()
+
+    # ---- public API (called from main process) ----
+
     def update(self, files: int = 1) -> None:
-        """推进文件计数（字节数通过 update_bytes 实时累加，此处不再重复加）"""
+        """推进文件计数"""
+        if self._shared_bytes is not None:
+            self._sync_shared_bytes()
         self._refresh_desc()
         self._bar.update(files)
 
-    def update_bytes(self, bytes_delta: int) -> None:
-        """实时更新已下载字节数（chunk 级别调用），不推进文件计数"""
-        should_refresh = False
-        with self._lock:
-            self.downloaded_bytes += bytes_delta
-            now = time.monotonic()
-            if now - self._last_sample_time >= self._SAMPLE_INTERVAL:
-                self._speed_samples.append((now, self.downloaded_bytes))
-                self._last_sample_time = now
-                # 清理超出窗口的旧样本
-                cutoff = now - self._SPEED_WINDOW
-                while self._speed_samples and self._speed_samples[0][0] < cutoff:
-                    self._speed_samples.popleft()
-                should_refresh = True
-        # 仅在采样间隔到达时刷新显示，避免过于频繁的终端刷新
-        if should_refresh:
-            self._refresh_desc()
-            self._bar.refresh()
-
-    def rollback_bytes(self, amount: int) -> None:
-        """回退已累加的字节数（文件下载失败时调用）"""
-        with self._lock:
-            self.downloaded_bytes = max(0, self.downloaded_bytes - amount)
-
     def _calc_recent_speed(self) -> float:
-        """基于滑动窗口计算实时速度 (bytes/s)"""
         if not self._speed_samples:
             return 0.0
         now = time.monotonic()
@@ -133,7 +262,6 @@ class _DownloadProgress:
         avg_speed = self.downloaded_bytes / elapsed if elapsed > 0 else 0
         cur_speed = self._calc_recent_speed()
         remaining_bytes = max(0, self.total_size - self.downloaded_bytes)
-        # ETA 优先使用实时速度（更准确），回退到平均速度
         effective_speed = cur_speed if cur_speed > 0 else avg_speed
         eta_str = _format_elapsed(remaining_bytes / effective_speed, width=7) if effective_speed > 0 else '     --'
 
@@ -148,20 +276,34 @@ class _DownloadProgress:
         self._bar.set_description(desc, refresh=False)
 
     def close(self) -> None:
+        self._stop_polling.set()
+        if self._poll_thread:
+            self._poll_thread.join(timeout=1)
+        if self._shared_bytes is not None:
+            self._sync_shared_bytes()
         self._bar.close()
 
     @property
     def total_downloaded(self) -> int:
+        if self._shared_bytes is not None:
+            with self._shared_bytes.get_lock():
+                return self._shared_bytes.value
         return self.downloaded_bytes
 
+
+# ======================================================================
+# DownloadService
+# ======================================================================
 
 class DownloadService:
     def __init__(self, client, concurrency: int = 4):
         self.client = client
         self.concurrency = concurrency
         self.run_id = str(uuid.uuid4())
-        # 协作式关闭：设置后所有工作线程尽快停止
-        self._shutdown = threading.Event()
+        # multiprocessing.Event so worker processes can observe shutdown
+        self._shutdown = multiprocessing.Event()
+        # Shared byte counter written by workers, read by progress poller
+        self._shared_bytes = multiprocessing.Value('q', 0)  # signed long long
 
     def request_shutdown(self) -> None:
         """请求优雅停止（由信号处理器调用）"""
@@ -170,97 +312,6 @@ class DownloadService:
     @property
     def is_shutting_down(self) -> bool:
         return self._shutdown.is_set()
-
-    # ------------------------------------------------------------------
-    # 单文件下载
-    # ------------------------------------------------------------------
-
-    def _download_file_once(
-        self, url: str, local_path: Path, expected_size: int,
-        on_chunk: Optional[Callable[[int], None]] = None,
-    ) -> None:
-        """下载单个文件（单次尝试）"""
-        part_file = local_path.with_suffix(local_path.suffix + '.part')
-
-        # MVP 简化：残留 .part 直接删除后重下
-        if part_file.exists():
-            part_file.unlink()
-
-        logger.debug(f'[{self.run_id}] file_download_started file={local_path.name}')
-
-        try:
-            resp = requests.get(url, stream=True, timeout=120)
-            resp.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            # S3/TOS URL 过期返回 403 或 404
-            if e.response is not None and e.response.status_code in (403, 404):
-                raise URLExpiredError(
-                    f'URL expired or invalid: {e.response.status_code}'
-                )
-            raise
-
-        with open(part_file, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                # 每个 chunk 检查关闭信号，保证最大 128KiB 粒度的响应延迟
-                if self.is_shutting_down:
-                    raise _ShutdownRequested()
-                f.write(chunk)
-                if on_chunk:
-                    on_chunk(len(chunk))
-
-        # 校验大小
-        actual_size = part_file.stat().st_size
-        if expected_size > 0 and actual_size != expected_size:
-            part_file.unlink()
-            raise ValueError(
-                f'Size mismatch: expected {expected_size}, got {actual_size}'
-            )
-
-        # 原子 rename
-        part_file.rename(local_path)
-        logger.debug(f'[{self.run_id}] file_download_succeeded file={local_path.name}')
-
-    def _download_file(
-        self, url: str, local_path: Path, expected_size: int,
-        on_chunk: Optional[Callable[[int], None]] = None,
-    ) -> None:
-        """下载单个文件（带重试，不重试 URLExpiredError 和 _ShutdownRequested）
-
-        重试间隔使用 shutdown 事件等待代替 time.sleep，保证 Ctrl+C 时等待可被立即中断。
-        """
-        from genrobot.utils import is_retryable_error
-        from genrobot.http_client import RateLimitedError
-
-        max_retries = 3
-        initial_delay = 1.0
-        backoff_factor = 2.0
-        max_delay = 32.0
-        delay = initial_delay
-
-        for attempt in range(max_retries):
-            try:
-                self._download_file_once(url, local_path, expected_size, on_chunk)
-                return
-            except _ShutdownRequested:
-                # 关闭请求不重试，直接向上传播
-                raise
-            except Exception as e:
-                if attempt == max_retries - 1 or not is_retryable_error(e):
-                    raise
-
-                # 429 使用服务端指定的等待时间
-                if isinstance(e, RateLimitedError):
-                    sleep_time = e.retry_after
-                else:
-                    import random
-                    jitter = delay * 0.25 * (random.random() * 2 - 1)
-                    sleep_time = min(delay + jitter, max_delay)
-                    delay = min(delay * backoff_factor, max_delay)
-
-                # 用 Event.wait 代替 time.sleep，使等待可被 shutdown 信号立即中断
-                interrupted = self._shutdown.wait(timeout=sleep_time)
-                if interrupted:
-                    raise _ShutdownRequested()
 
     # ------------------------------------------------------------------
     # 本地去重 & 任务构建
@@ -325,46 +376,47 @@ class DownloadService:
         return {entry['download_spec']: entry['url'] for entry in urls_list}
 
     # ------------------------------------------------------------------
-    # 结果收集（从 future 中提取结果，更新计数器和进度条）
+    # 结果收集
     # ------------------------------------------------------------------
 
-    def _collect_future(
-        self, future, item: Dict, progress: _DownloadProgress,
+    def _collect_result(
+        self, result: Tuple, item: Dict, progress: _DownloadProgress,
         url_expired_items: List[Dict],
         counters: Dict,
     ) -> None:
-        """处理单个 future 的结果，更新 counters 和 progress"""
-        try:
-            future.result()
+        """处理 worker 返回的结果 tuple，更新计数器和进度条"""
+        status = result[0]
+        if status == 'success':
             counters['succeeded'] += 1
             counters['downloaded_bytes'] += item['size']
             progress.update(1)
-        except _ShutdownRequested:
+        elif status == 'cancelled':
             logger.info(
                 f'[{self.run_id}] file_cancelled file={item["local_path"].name}'
             )
-        except URLExpiredError:
+        elif status == 'url_expired':
             url_expired_items.append(item)
             logger.warning(
                 f'[{self.run_id}] url_expired file={item["local_path"].name}'
             )
-        except Exception as e:
+        elif status == 'failed':
             counters['failed'] += 1
             progress.update(1)
+            error_msg = result[2] if len(result) > 2 else 'unknown'
             logger.error(
                 f'[{self.run_id}] file_download_failed '
-                f'file={item["local_path"].name} error={e}'
+                f'file={item["local_path"].name} error={error_msg}'
             )
 
     # ------------------------------------------------------------------
-    # 主入口：流水线式持续下载
+    # 主入口：流水线式多进程下载
     # ------------------------------------------------------------------
 
     def download_dataset(
         self, dataset_token: str, output_dir: Path,
         organize_by_sst: bool = True, skip_existing: bool = True,
     ) -> int:
-        """下载数据集（流水线模式：持续提交任务，不在批次间等待），返回退出码"""
+        """下载数据集（流水线 + 多进程），返回退出码"""
         start_time = datetime.now()
 
         # 1. 获取数据集统计信息
@@ -392,38 +444,43 @@ class DownloadService:
             f'total_files={total_files} total_size={total_size}'
         )
 
-        # 显示数据集信息（对齐 PRD 8.4）
         typer.echo(t('dataset_info', dataset_name))
         typer.echo(t('dataset_file_size', total_files, _format_size(total_size)))
         typer.echo('')
         typer.echo(t('download_start', self.concurrency))
 
-        # 2. 流水线下载：持续提交任务，在拉取下一页时顺带收割已完成的 future
+        # 2. 流水线下载：持续提交任务到进程池，不在批次间等待
         total_skipped = 0
         counters: Dict = {'succeeded': 0, 'failed': 0, 'downloaded_bytes': 0}
         cursor = None
         page_num = 0
 
-        progress = _DownloadProgress(total_files, total_size)
+        progress = _DownloadProgress(
+            total_files, total_size, self._shared_bytes,
+        )
 
-        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+        with ProcessPoolExecutor(
+            max_workers=self.concurrency,
+            initializer=_worker_init,
+            initargs=(self._shared_bytes, self._shutdown, self.run_id),
+        ) as executor:
             pending: Dict = {}          # future -> item
             url_expired_items: List[Dict] = []
 
-            # ---- 2a. 逐页拉取 meta → 过滤 → 签发 → 提交（不等待本页完成） ----
+            # ---- 2a. 逐页拉取 → 过滤 → 签发 → 提交（不等待本页完成） ----
             while True:
                 if self.is_shutting_down:
                     break
 
-                # 收割已完成的 future，避免内存堆积并保持进度条实时
+                # 收割已完成的 future，避免内存堆积
                 done_futures = [f for f in pending if f.done()]
                 for future in done_futures:
                     item = pending.pop(future)
-                    self._collect_future(
-                        future, item, progress, url_expired_items, counters,
+                    result = future.result()
+                    self._collect_result(
+                        result, item, progress, url_expired_items, counters,
                     )
 
-                # 拉取一页 meta
                 params: Dict = {'limit': BATCH_SIZE}
                 if cursor:
                     params['cursor'] = cursor
@@ -441,7 +498,6 @@ class DownloadService:
                     f'items={len(page_metas)}'
                 )
 
-                # 过滤已完成文件，构建下载任务
                 tasks, skipped = self._filter_and_build_tasks(
                     page_metas, dataset_token, output_dir,
                     organize_by_sst, skip_existing,
@@ -449,7 +505,6 @@ class DownloadService:
                 total_skipped += skipped
                 progress.update(skipped)
 
-                # 签发 URL 并提交到线程池（不阻塞等待）
                 if tasks:
                     specs = [item['download_spec'] for item in tasks]
                     url_map = self._issue_urls(specs, dataset_token)
@@ -462,10 +517,8 @@ class DownloadService:
                             counters['failed'] += 1
                             progress.update(1)
                             continue
-                        future = executor.submit(
-                            self._download_file, url, item['local_path'],
-                            item['size'], on_chunk=progress.update_bytes,
-                        )
+                        work = (url, str(item['local_path']), item['size'])
+                        future = executor.submit(_download_file_wp, work)
                         pending[future] = item
 
                 if not data.get('has_more'):
@@ -475,8 +528,9 @@ class DownloadService:
             # ---- 2b. 等待剩余在途下载完成 ----
             for future in as_completed(list(pending)):
                 item = pending.pop(future)
-                self._collect_future(
-                    future, item, progress, url_expired_items, counters,
+                result = future.result()
+                self._collect_result(
+                    result, item, progress, url_expired_items, counters,
                 )
                 if self.is_shutting_down:
                     break
@@ -499,35 +553,35 @@ class DownloadService:
                         counters['failed'] += 1
                         progress.update(1)
                         continue
-                    future = executor.submit(
-                        self._download_file, url, item['local_path'],
-                        item['size'], on_chunk=progress.update_bytes,
-                    )
+                    work = (url, str(item['local_path']), item['size'])
+                    future = executor.submit(_download_file_wp, work)
                     retry_futures[future] = item
 
                 for future in as_completed(retry_futures):
                     item = retry_futures[future]
-                    try:
-                        future.result()
+                    result = future.result()
+                    status = result[0]
+                    if status == 'success':
                         counters['succeeded'] += 1
                         counters['downloaded_bytes'] += item['size']
                         progress.update(1)
-                    except _ShutdownRequested:
+                    elif status == 'cancelled':
                         logger.info(
                             f'[{self.run_id}] file_cancelled '
                             f'file={item["local_path"].name}'
                         )
-                    except Exception as e:
+                    else:
                         counters['failed'] += 1
                         progress.update(1)
+                        error_msg = result[2] if len(result) > 2 else 'unknown'
                         logger.error(
                             f'[{self.run_id}] file_download_failed_after_reissue '
-                            f'file={item["local_path"].name} error={e}'
+                            f'file={item["local_path"].name} error={error_msg}'
                         )
 
         progress.close()
 
-        # 3. 输出摘要（对齐 PRD 8.4 格式）
+        # 3. 输出摘要
         total_succeeded = counters['succeeded']
         total_failed = counters['failed']
         total_downloaded_bytes = counters['downloaded_bytes']
