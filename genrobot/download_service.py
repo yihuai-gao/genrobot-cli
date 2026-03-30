@@ -1,11 +1,12 @@
 import logging
 import multiprocessing
+import queue
 import random
 import signal as _signal_mod
 import threading
 import time
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, FIRST_COMPLETED, wait
 from datetime import datetime
 from pathlib import Path
 from collections import deque
@@ -20,7 +21,7 @@ from genrobot.i18n import t
 
 logger = logging.getLogger('genrobot')
 
-BATCH_SIZE = 20
+BATCH_SIZE = 200
 DOWNLOAD_CHUNK_SIZE = 1024 * 128  # 128KiB
 
 
@@ -412,11 +413,92 @@ class DownloadService:
     # 主入口：流水线式多进程下载
     # ------------------------------------------------------------------
 
+    def _start_producer(
+        self, dataset_token: str, output_dir: Path,
+        organize_by_sst: bool, skip_existing: bool,
+        task_queue: queue.Queue,
+    ) -> threading.Thread:
+        """启动后台生产者线程：拉取 meta → 过滤 → 签发 URL → 放入队列。
+
+        队列消息格式:
+            ('task',   url, item)  — 待下载文件
+            ('skip',   count)      — 已跳过的文件数
+            ('no_url', item)       — URL 签发失败
+            None                   — 生产者结束（哨兵）
+        """
+        def _produce():
+            cursor = None
+            page_num = 0
+            try:
+                while True:
+                    if self.is_shutting_down:
+                        return
+
+                    params: Dict = {'limit': BATCH_SIZE}
+                    if cursor:
+                        params['cursor'] = cursor
+
+                    resp = self.client.get(
+                        f'/partner/datasets/{dataset_token}/download-meta',
+                        params=params,
+                    )
+                    data = resp.get('data', {})
+                    page_metas = data.get('items', [])
+                    page_num += 1
+
+                    logger.info(
+                        f'[{self.run_id}] meta_page_fetched page={page_num} '
+                        f'items={len(page_metas)}'
+                    )
+
+                    tasks, skipped = self._filter_and_build_tasks(
+                        page_metas, dataset_token, output_dir,
+                        organize_by_sst, skip_existing,
+                    )
+                    if skipped:
+                        self._queue_put(task_queue, ('skip', skipped))
+
+                    if tasks:
+                        specs = [item['download_spec'] for item in tasks]
+                        url_map = self._issue_urls(specs, dataset_token)
+
+                        for item in tasks:
+                            if self.is_shutting_down:
+                                return
+                            url = url_map.get(item['download_spec'])
+                            if url:
+                                self._queue_put(task_queue, ('task', url, item))
+                            else:
+                                self._queue_put(task_queue, ('no_url', item))
+
+                    if not data.get('has_more'):
+                        return
+                    cursor = data.get('cursor')
+            except Exception as e:
+                logger.error(
+                    f'[{self.run_id}] producer_error error={e}'
+                )
+            finally:
+                task_queue.put(None)  # sentinel — always sent
+
+        thread = threading.Thread(target=_produce, daemon=True, name='task-producer')
+        thread.start()
+        return thread
+
+    def _queue_put(self, q: queue.Queue, item) -> None:
+        """向队列放入元素，支持 shutdown 中断（避免 put 永久阻塞）"""
+        while not self.is_shutting_down:
+            try:
+                q.put(item, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
     def download_dataset(
         self, dataset_token: str, output_dir: Path,
         organize_by_sst: bool = True, skip_existing: bool = True,
     ) -> int:
-        """下载数据集（流水线 + 多进程），返回退出码"""
+        """下载数据集（后台生产者 + 多进程流水线），返回退出码"""
         start_time = datetime.now()
 
         # 1. 获取数据集统计信息
@@ -449,14 +531,20 @@ class DownloadService:
         typer.echo('')
         typer.echo(t('download_start', self.concurrency))
 
-        # 2. 流水线下载：持续提交任务到进程池，不在批次间等待
+        # 2. 启动后台生产者 + 多进程消费者流水线
         total_skipped = 0
         counters: Dict = {'succeeded': 0, 'failed': 0, 'downloaded_bytes': 0}
-        cursor = None
-        page_num = 0
 
         progress = _DownloadProgress(
             total_files, total_size, self._shared_bytes,
+        )
+
+        # 有界队列：生产者放入任务，主线程取出并提交给进程池
+        # 容量设为 concurrency×3，保证 workers 永远有活干
+        task_queue: queue.Queue = queue.Queue(maxsize=self.concurrency * 3)
+        producer_thread = self._start_producer(
+            dataset_token, output_dir, organize_by_sst, skip_existing,
+            task_queue,
         )
 
         with ProcessPoolExecutor(
@@ -466,76 +554,78 @@ class DownloadService:
         ) as executor:
             pending: Dict = {}          # future -> item
             url_expired_items: List[Dict] = []
+            producer_done = False
 
-            # ---- 2a. 逐页拉取 → 过滤 → 签发 → 提交（不等待本页完成） ----
-            while True:
+            # ---- 阶段 1：交替提交任务和收割结果 ----
+            while not producer_done:
                 if self.is_shutting_down:
                     break
 
-                # 收割已完成的 future，避免内存堆积
+                # 1a. 收割已完成的 future
                 done_futures = [f for f in pending if f.done()]
                 for future in done_futures:
                     item = pending.pop(future)
-                    result = future.result()
                     self._collect_result(
-                        result, item, progress, url_expired_items, counters,
+                        future.result(), item, progress,
+                        url_expired_items, counters,
                     )
 
-                params: Dict = {'limit': BATCH_SIZE}
-                if cursor:
-                    params['cursor'] = cursor
+                # 1b. 批量拉取队列中所有就绪任务并提交
+                pulled = False
+                while True:
+                    try:
+                        msg = task_queue.get_nowait()
+                        pulled = True
+                    except queue.Empty:
+                        break
 
-                resp = self.client.get(
-                    f'/partner/datasets/{dataset_token}/download-meta',
-                    params=params,
-                )
-                data = resp.get('data', {})
-                page_metas = data.get('items', [])
-                page_num += 1
-
-                logger.info(
-                    f'[{self.run_id}] meta_page_fetched page={page_num} '
-                    f'items={len(page_metas)}'
-                )
-
-                tasks, skipped = self._filter_and_build_tasks(
-                    page_metas, dataset_token, output_dir,
-                    organize_by_sst, skip_existing,
-                )
-                total_skipped += skipped
-                progress.update(skipped)
-
-                if tasks:
-                    specs = [item['download_spec'] for item in tasks]
-                    url_map = self._issue_urls(specs, dataset_token)
-
-                    for item in tasks:
-                        if self.is_shutting_down:
-                            break
-                        url = url_map.get(item['download_spec'])
-                        if not url:
-                            counters['failed'] += 1
-                            progress.update(1)
-                            continue
+                    if msg is None:
+                        producer_done = True
+                        break
+                    elif msg[0] == 'skip':
+                        total_skipped += msg[1]
+                        progress.update(msg[1])
+                    elif msg[0] == 'no_url':
+                        counters['failed'] += 1
+                        progress.update(1)
+                    elif msg[0] == 'task':
+                        _, url, item = msg
                         work = (url, str(item['local_path']), item['size'])
                         future = executor.submit(_download_file_wp, work)
                         pending[future] = item
 
-                if not data.get('has_more'):
-                    break
-                cursor = data.get('cursor')
+                # 1c. 队列空且生产者未结束 → 短暂等待避免空转
+                if not pulled and not producer_done:
+                    try:
+                        msg = task_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
 
-            # ---- 2b. 等待剩余在途下载完成 ----
+                    if msg is None:
+                        producer_done = True
+                    elif msg[0] == 'skip':
+                        total_skipped += msg[1]
+                        progress.update(msg[1])
+                    elif msg[0] == 'no_url':
+                        counters['failed'] += 1
+                        progress.update(1)
+                    elif msg[0] == 'task':
+                        _, url, item = msg
+                        work = (url, str(item['local_path']), item['size'])
+                        future = executor.submit(_download_file_wp, work)
+                        pending[future] = item
+
+            # ---- 阶段 2：等待剩余在途下载完成 ----
             for future in as_completed(list(pending)):
-                item = pending.pop(future)
-                result = future.result()
-                self._collect_result(
-                    result, item, progress, url_expired_items, counters,
-                )
                 if self.is_shutting_down:
                     break
+                item = pending.pop(future)
+                self._collect_result(
+                    future.result(), item, progress,
+                    url_expired_items, counters,
+                )
 
-            # ---- 2c. URL 过期重试 ----
+            # ---- 阶段 3：URL 过期重试 ----
             if url_expired_items and not self.is_shutting_down:
                 logger.info(
                     f'[{self.run_id}] url_expired_reissue '
@@ -579,6 +669,7 @@ class DownloadService:
                             f'file={item["local_path"].name} error={error_msg}'
                         )
 
+        producer_thread.join(timeout=2)
         progress.close()
 
         # 3. 输出摘要
