@@ -189,10 +189,6 @@ class DownloadService:
         logger.debug(f'[{self.run_id}] file_download_started file={local_path.name}')
 
         try:
-            # url = url.replace(".mcap", "_vio.mcap")
-            # url = url.split(".mcap")[0] + "_vio.mcap?response-content-type=application%2Foctet-stream&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA22SRFQLKY6AY4EPW%2F20260329%2Fcn-northwest-1%2Fs3%2Faws4_request&X-Amz-Date=20260329T234822Z&X-Amz-Expires=7200&X-Amz-SignedHeaders=host&X-Amz-Signature=d9f224535f32dd17f1297ed8c520aa5bd3a1eaa0564e6caa2dfed8949c95dd13"
-            # https://data-whale.s3.cn-northwest-1.amazonaws.com.cn/DAS-G-rv1126b-2ef41c0ef15d6c87-edge_events-das-gripper_20260325033408_none_none_00000000_vio.mcap?response-content-type=application%2Foctet-stream&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA22SRFQLKY6AY4EPW%2F20260329%2Fcn-northwest-1%2Fs3%2Faws4_request&X-Amz-Date=20260329T233328Z&X-Amz-Expires=7200&X-Amz-SignedHeaders=host&X-Amz-Signature=3115afdf2e9821d61d285c7c1e242b01a3c66a1984aea9676944599c29daa7d6
-            print(url)
             resp = requests.get(url, stream=True, timeout=120)
             resp.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -329,119 +325,46 @@ class DownloadService:
         return {entry['download_spec']: entry['url'] for entry in urls_list}
 
     # ------------------------------------------------------------------
-    # 批次执行
+    # 结果收集（从 future 中提取结果，更新计数器和进度条）
     # ------------------------------------------------------------------
 
-    def _execute_batch(
-        self, batch: List[Dict], dataset_token: str,
-        progress: _DownloadProgress,
-    ) -> Tuple[int, int, int]:
-        """执行单批次：签发 URL → 并发下载。返回 (succeeded, failed, downloaded_bytes)"""
-        specs = [item['download_spec'] for item in batch]
-        url_map = self._issue_urls(specs, dataset_token)
-
-        succeeded = 0
-        failed = 0
-        downloaded_bytes = 0
-        url_expired_items: List[Dict] = []
-
-        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            futures = {}
-            for item in batch:
-                # 关闭信号已设置时不再提交新任务
-                if self.is_shutting_down:
-                    break
-                url = url_map.get(item['download_spec'])
-                if not url:
-                    failed += 1
-                    progress.update(1)
-                    continue
-                future = executor.submit(
-                    self._download_file, url, item['local_path'], item['size'],
-                    on_chunk=progress.update_bytes,
-                )
-                futures[future] = item
-
-            for future in as_completed(futures):
-                item = futures[future]
-                try:
-                    future.result()
-                    succeeded += 1
-                    downloaded_bytes += item['size']
-                    # 字节数已在 chunk 回调中实时累加，此处只推进文件计数
-                    progress.update(1)
-                except _ShutdownRequested:
-                    # 用户取消：不计入失败，不更新进度（留给 summary 显示）
-                    logger.info(
-                        f'[{self.run_id}] file_cancelled file={item["local_path"].name}'
-                    )
-                except URLExpiredError:
-                    url_expired_items.append(item)
-                    logger.warning(
-                        f'[{self.run_id}] url_expired file={item["local_path"].name}'
-                    )
-                except Exception as e:
-                    failed += 1
-                    progress.update(1)
-                    logger.error(
-                        f'[{self.run_id}] file_download_failed '
-                        f'file={item["local_path"].name} error={e}'
-                    )
-
-        # 已请求关闭则跳过 URL 过期重试，让主循环尽快退出
-        if url_expired_items and not self.is_shutting_down:
+    def _collect_future(
+        self, future, item: Dict, progress: _DownloadProgress,
+        url_expired_items: List[Dict],
+        counters: Dict,
+    ) -> None:
+        """处理单个 future 的结果，更新 counters 和 progress"""
+        try:
+            future.result()
+            counters['succeeded'] += 1
+            counters['downloaded_bytes'] += item['size']
+            progress.update(1)
+        except _ShutdownRequested:
             logger.info(
-                f'[{self.run_id}] url_expired_reissue count={len(url_expired_items)}'
+                f'[{self.run_id}] file_cancelled file={item["local_path"].name}'
             )
-            retry_specs = [item['download_spec'] for item in url_expired_items]
-            new_url_map = self._issue_urls(retry_specs, dataset_token)
-
-            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-                futures = {}
-                for item in url_expired_items:
-                    if self.is_shutting_down:
-                        break
-                    url = new_url_map.get(item['download_spec'])
-                    if not url:
-                        failed += 1
-                        progress.update(1)
-                        continue
-                    future = executor.submit(
-                        self._download_file, url, item['local_path'], item['size'],
-                        on_chunk=progress.update_bytes,
-                    )
-                    futures[future] = item
-
-                for future in as_completed(futures):
-                    item = futures[future]
-                    try:
-                        future.result()
-                        succeeded += 1
-                        downloaded_bytes += item['size']
-                        progress.update(1)
-                    except _ShutdownRequested:
-                        logger.info(
-                            f'[{self.run_id}] file_cancelled file={item["local_path"].name}'
-                        )
-                    except Exception as e:
-                        failed += 1
-                        progress.update(1)
-                        logger.error(
-                            f'[{self.run_id}] file_download_failed_after_reissue '
-                            f'file={item["local_path"].name} error={e}'
-                        )
-
-        return succeeded, failed, downloaded_bytes
+        except URLExpiredError:
+            url_expired_items.append(item)
+            logger.warning(
+                f'[{self.run_id}] url_expired file={item["local_path"].name}'
+            )
+        except Exception as e:
+            counters['failed'] += 1
+            progress.update(1)
+            logger.error(
+                f'[{self.run_id}] file_download_failed '
+                f'file={item["local_path"].name} error={e}'
+            )
 
     # ------------------------------------------------------------------
-    # 主入口：流式分批下载
+    # 主入口：流水线式持续下载
     # ------------------------------------------------------------------
 
     def download_dataset(
         self, dataset_token: str, output_dir: Path,
         organize_by_sst: bool = True, skip_existing: bool = True,
     ) -> int:
-        """下载数据集（流式分批模式），返回退出码"""
+        """下载数据集（流水线模式：持续提交任务，不在批次间等待），返回退出码"""
         start_time = datetime.now()
 
         # 1. 获取数据集统计信息
@@ -475,64 +398,139 @@ class DownloadService:
         typer.echo('')
         typer.echo(t('download_start', self.concurrency))
 
-        # 2. 流式分批：逐页拉取 meta → 过滤 → 签发 → 下载
-        total_succeeded = 0
+        # 2. 流水线下载：持续提交任务，在拉取下一页时顺带收割已完成的 future
         total_skipped = 0
-        total_failed = 0
-        total_downloaded_bytes = 0
+        counters: Dict = {'succeeded': 0, 'failed': 0, 'downloaded_bytes': 0}
         cursor = None
         page_num = 0
 
         progress = _DownloadProgress(total_files, total_size)
 
-        while True:
-            # 用户已请求关闭，停止拉取新批次
-            if self.is_shutting_down:
-                break
+        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            pending: Dict = {}          # future -> item
+            url_expired_items: List[Dict] = []
 
-            # 2a. 拉取一页 meta
-            params: Dict = {'limit': BATCH_SIZE}
-            if cursor:
-                params['cursor'] = cursor
+            # ---- 2a. 逐页拉取 meta → 过滤 → 签发 → 提交（不等待本页完成） ----
+            while True:
+                if self.is_shutting_down:
+                    break
 
-            resp = self.client.get(
-                f'/partner/datasets/{dataset_token}/download-meta',
-                params=params,
-            )
-            data = resp.get('data', {})
-            page_metas = data.get('items', [])
-            page_num += 1
+                # 收割已完成的 future，避免内存堆积并保持进度条实时
+                done_futures = [f for f in pending if f.done()]
+                for future in done_futures:
+                    item = pending.pop(future)
+                    self._collect_future(
+                        future, item, progress, url_expired_items, counters,
+                    )
 
-            logger.info(
-                f'[{self.run_id}] meta_page_fetched page={page_num} '
-                f'items={len(page_metas)}'
-            )
+                # 拉取一页 meta
+                params: Dict = {'limit': BATCH_SIZE}
+                if cursor:
+                    params['cursor'] = cursor
 
-            # 2b. 过滤已完成文件，构建下载任务
-            tasks, skipped = self._filter_and_build_tasks(
-                page_metas, dataset_token, output_dir,
-                organize_by_sst, skip_existing,
-            )
-            total_skipped += skipped
-            progress.update(skipped)
-
-            # 2c. 签发 URL 并下载
-            if tasks:
-                succeeded, failed, batch_bytes = self._execute_batch(
-                    tasks, dataset_token, progress,
+                resp = self.client.get(
+                    f'/partner/datasets/{dataset_token}/download-meta',
+                    params=params,
                 )
-                total_succeeded += succeeded
-                total_failed += failed
-                total_downloaded_bytes += batch_bytes
+                data = resp.get('data', {})
+                page_metas = data.get('items', [])
+                page_num += 1
 
-            # 2d. 检查是否还有更多页
-            if not data.get('has_more'):
-                break
-            cursor = data.get('cursor')
+                logger.info(
+                    f'[{self.run_id}] meta_page_fetched page={page_num} '
+                    f'items={len(page_metas)}'
+                )
+
+                # 过滤已完成文件，构建下载任务
+                tasks, skipped = self._filter_and_build_tasks(
+                    page_metas, dataset_token, output_dir,
+                    organize_by_sst, skip_existing,
+                )
+                total_skipped += skipped
+                progress.update(skipped)
+
+                # 签发 URL 并提交到线程池（不阻塞等待）
+                if tasks:
+                    specs = [item['download_spec'] for item in tasks]
+                    url_map = self._issue_urls(specs, dataset_token)
+
+                    for item in tasks:
+                        if self.is_shutting_down:
+                            break
+                        url = url_map.get(item['download_spec'])
+                        if not url:
+                            counters['failed'] += 1
+                            progress.update(1)
+                            continue
+                        future = executor.submit(
+                            self._download_file, url, item['local_path'],
+                            item['size'], on_chunk=progress.update_bytes,
+                        )
+                        pending[future] = item
+
+                if not data.get('has_more'):
+                    break
+                cursor = data.get('cursor')
+
+            # ---- 2b. 等待剩余在途下载完成 ----
+            for future in as_completed(list(pending)):
+                item = pending.pop(future)
+                self._collect_future(
+                    future, item, progress, url_expired_items, counters,
+                )
+                if self.is_shutting_down:
+                    break
+
+            # ---- 2c. URL 过期重试 ----
+            if url_expired_items and not self.is_shutting_down:
+                logger.info(
+                    f'[{self.run_id}] url_expired_reissue '
+                    f'count={len(url_expired_items)}'
+                )
+                retry_specs = [item['download_spec'] for item in url_expired_items]
+                new_url_map = self._issue_urls(retry_specs, dataset_token)
+
+                retry_futures: Dict = {}
+                for item in url_expired_items:
+                    if self.is_shutting_down:
+                        break
+                    url = new_url_map.get(item['download_spec'])
+                    if not url:
+                        counters['failed'] += 1
+                        progress.update(1)
+                        continue
+                    future = executor.submit(
+                        self._download_file, url, item['local_path'],
+                        item['size'], on_chunk=progress.update_bytes,
+                    )
+                    retry_futures[future] = item
+
+                for future in as_completed(retry_futures):
+                    item = retry_futures[future]
+                    try:
+                        future.result()
+                        counters['succeeded'] += 1
+                        counters['downloaded_bytes'] += item['size']
+                        progress.update(1)
+                    except _ShutdownRequested:
+                        logger.info(
+                            f'[{self.run_id}] file_cancelled '
+                            f'file={item["local_path"].name}'
+                        )
+                    except Exception as e:
+                        counters['failed'] += 1
+                        progress.update(1)
+                        logger.error(
+                            f'[{self.run_id}] file_download_failed_after_reissue '
+                            f'file={item["local_path"].name} error={e}'
+                        )
 
         progress.close()
 
         # 3. 输出摘要（对齐 PRD 8.4 格式）
+        total_succeeded = counters['succeeded']
+        total_failed = counters['failed']
+        total_downloaded_bytes = counters['downloaded_bytes']
         cancelled = self.is_shutting_down
         elapsed = (datetime.now() - start_time).total_seconds()
         avg_speed = (
