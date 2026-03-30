@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genrobot-cli"
+description = "GenRobot CLI - Embodied Intelligence Multimodal Dataset Download Tool"
+requires-python = ">=3.9.0"
+dynamic = ["version"]
+
+dependencies = [
+    "typer>=0.9.0",
+    "requests>=2.31.0",
+    "tqdm>=4.66.0",
+]
+
+[project.scripts]
+genrobot = "genrobot.cli:app"
+
+[tool.setuptools.dynamic]
+version = {attr = "genrobot.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["genrobot*"]
